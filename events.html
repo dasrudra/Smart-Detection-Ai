@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Events</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 18px; }
+    th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
+    th { background: #f6f6f6; }
+    .muted { color:#666; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h2>Latest Events (limit={{ limit }})</h2>
+  <p><a href="/">Dashboard</a> | <a href="/hourly">Hourly</a></p>
+
+  <table>
+    <tr>
+      <th>Time</th><th>Direction</th><th>Label</th><th>Track ID</th><th>Conf</th><th>Snapshot Path</th>
+    </tr>
+    {% for r in rows %}
+      <tr>
+        <td>{{ r["ts"] }}</td>
+        <td><b>{{ r["direction"] }}</b></td>
+        <td>{{ r["label"] }}</td>
+        <td>{{ r["track_id"] }}</td>
+        <td>{{ "%.2f"|format(r["conf"] or 0) }}</td>
+        <td>
+          <div class="muted">{{ r["snapshot_path"] }}</div>
+        </td>
+      </tr>
+    {% endfor %}
+  </table>
+</body>
+</html>

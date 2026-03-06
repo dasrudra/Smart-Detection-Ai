@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Office Gate AI Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; }
+    .top { display:flex; gap:24px; flex-wrap: wrap; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:16px; min-width:220px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 18px; }
+    th, td { border: 1px solid #ddd; padding: 8px; }
+    th { background: #f6f6f6; }
+    a { text-decoration:none; }
+  </style>
+</head>
+<body>
+  <h2>Office Gate AI Dashboard</h2>
+  <p>
+    <b>Date:</b> {{ today }} |
+    <a href="/events">Events</a> |
+    <a href="/hourly">Hourly</a>
+  </p>
+
+  <div class="top">
+    <div class="card">
+      <h3>Totals (Today)</h3>
+      <p><b>Events:</b> {{ total_events }}</p>
+      <p><b>IN:</b> {{ in_total }}</p>
+      <p><b>OUT:</b> {{ out_total }}</p>
+      <p><b>NET:</b> {{ net }}</p>
+    </div>
+
+    <div class="card">
+      <h3>Notes</h3>
+      <p>This dashboard reads from <code>database/gate_events.db</code>.</p>
+      <p>Snapshots are shown in Events page (file path).</p>
+    </div>
+  </div>
+
+  <h3>Top Classes (Today)</h3>
+  <table>
+    <tr><th>Label</th><th>IN</th><th>OUT</th><th>Total</th></tr>
+    {% for r in class_rows %}
+      <tr>
+        <td>{{ r["label"] }}</td>
+        <td>{{ r["in_count"] }}</td>
+        <td>{{ r["out_count"] }}</td>
+        <td>{{ r["in_count"] + r["out_count"] }}</td>
+      </tr>
+    {% endfor %}
+  </table>
+</body>
+</html>
