@@ -7,36 +7,23 @@ import sqlite3
 from datetime import datetime
 from collections import defaultdict, Counter
 from urllib.parse import quote
+from camera_config import CAMERAS
+from camera_processor import CameraProcessor
+
+ACTIVE_CAM = CAMERAS[0]
 
 # ----------------------------
 # SETTINGS
 # ----------------------------
-MODEL_PATH = "models/yolov8n.pt"
-
-# ----------------------------
-# IP CAMERA SETTINGS
-# ----------------------------
-IP_CAM_IP = "10.203.90.207"
-IP_CAM_USER = "tvl"
-IP_CAM_PASSWORD = "235@YngTvl"
-
-ENC_USER = quote(IP_CAM_USER, safe="")
-ENC_PASS = quote(IP_CAM_PASSWORD, safe="")
-
-# Try lower stream first for speed, then fallback
-CAMERA_CANDIDATES = [
-    f"rtsp://{ENC_USER}:{ENC_PASS}@{IP_CAM_IP}:554/profile3/media.smp",
-    f"rtsp://{ENC_USER}:{ENC_PASS}@{IP_CAM_IP}:554/profile4/media.smp",
-    f"rtsp://{ENC_USER}:{ENC_PASS}@{IP_CAM_IP}:554/profile2/media.smp",
-]
+MODEL_PATH = "models/yolov8s.pt"
 
 # ----------------------------
 # DETECTION SETTINGS
 # ----------------------------
 RESIZE_W = 960             # faster than 1280
-MODEL_IMGSZ = 640          # faster inference
-CONF_THRES = 0.14          # lower so far/small objects can still be detected
-PROCESS_EVERY_N_FRAMES = 2 # detect every 2nd frame for speed
+MODEL_IMGSZ = 512          # faster inference
+CONF_THRES = 0.30
+PROCESS_EVERY_N_FRAMES = 4 # detect every 4th frame for speed
 
 # COCO class IDs:
 # 0=person, 2=car, 3=motorcycle, 5=bus, 7=truck
@@ -51,8 +38,8 @@ DISPLAY_LABELS = {
     "micro": "micro",
 }
 
-MIN_BOX_W = 12
-MIN_BOX_H = 16
+MIN_BOX_W = 22
+MIN_BOX_H = 28
 
 # Ignore static false-person detections
 PERSON_MIN_MOVE_PX = 10
@@ -63,7 +50,7 @@ PERSON_NEAR_LINE_MARGIN = 40
 DUPLICATE_IOU_THRES = 0.45
 
 # Stable relabeling for van-like vehicles using current COCO model
-ENABLE_MICRO_ALIAS = True
+ENABLE_MICRO_ALIAS = False
 MICRO_MIN_AR = 1.45      # width/height lower bound
 MICRO_MAX_AR = 3.40      # width/height upper bound
 MICRO_MIN_H = 28         # ignore tiny boxes
@@ -96,6 +83,14 @@ ROI_RESIZE_STEP = 16
 # Dashboard overlay
 DASH_TOP_N = 4
 PANEL_W = 300
+
+# ----------------------------
+# BANGLADESHI NUMBER PLATE
+# ----------------------------
+ENABLE_PLATE_RECOGNITION = True
+PLATE_TARGET_LABELS = {"car", "truck", "bus", "micro", "motorcycle"}
+PLATE_MIN_BOX_W = 110
+PLATE_MIN_BOX_H = 70
 
 # Daily / hourly logs (CSV backup)
 LOG_ROOT = "logs"
@@ -350,7 +345,7 @@ def draw_dashboard(frame, fps, line_info, roi, in_total, out_total, in_by_class,
     alpha = 0.40
     frame[:] = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
 
-    net = in_total - out_total
+    net = in_total + out_total
 
     cv2.putText(frame, "Gate Counter", (x0 + 10, y0 + 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -426,9 +421,17 @@ def open_ip_camera(candidates, warmup_sec=2.5):
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 
+def ensure_column(conn, table_name, column_name, column_type):
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table_name})").fetchall()]
+    if column_name not in cols:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+        conn.commit()
+
 cur.execute("""
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id TEXT,
+    camera_name TEXT,
     ts TEXT NOT NULL,
     date TEXT NOT NULL,
     hour TEXT NOT NULL,
@@ -452,34 +455,49 @@ ON events(date, hour)
 cur.execute("""
 CREATE TABLE IF NOT EXISTS hourly_summary (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id TEXT,
+    camera_name TEXT,
     date TEXT NOT NULL,
     hour TEXT NOT NULL,
     label TEXT NOT NULL,
     direction TEXT NOT NULL,
     count INTEGER NOT NULL,
-    UNIQUE(date, hour, label, direction)
+    UNIQUE(camera_id, date, hour, label, direction)
 )
 """)
-
 conn.commit()
 
-def db_insert_event(ts_str, direction, label, track_id, conf, roi, in_total, out_total, net_total, snapshot_path):
+ensure_column(conn, "events", "plate_text", "TEXT")
+ensure_column(conn, "events", "plate_score", "REAL")
+ensure_column(conn, "events", "camera_id", "TEXT")
+ensure_column(conn, "events", "camera_name", "TEXT")
+ensure_column(conn, "hourly_summary", "camera_id", "TEXT")
+ensure_column(conn, "hourly_summary", "camera_name", "TEXT")
+
+def db_insert_event(camera_id, camera_name, ts_str, direction, label, track_id, conf, roi, in_total, out_total, net_total, snapshot_path):
     day = ts_str.split(" ")[0]
     hr = ts_str.split(" ")[1][:2]
 
     cur.execute("""
-    INSERT INTO events(ts, date, hour, direction, label, track_id, conf, roi, in_total, out_total, net_total, snapshot_path)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (ts_str, day, hr, direction, label, track_id, conf, roi, in_total, out_total, net_total, snapshot_path))
+    INSERT INTO events(
+        camera_id, camera_name, ts, date, hour, direction, label,
+        track_id, conf, roi, in_total, out_total, net_total, snapshot_path
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        camera_id, camera_name, ts_str, day, hr, direction, label,
+        track_id, conf, roi, in_total, out_total, net_total, snapshot_path
+    ))
     conn.commit()
+    return cur.lastrowid
 
-def db_upsert_hourly(date, hour, label, direction, inc=1):
+def db_upsert_hourly(camera_id, camera_name, date, hour, label, direction, inc=1):
     cur.execute("""
-    INSERT INTO hourly_summary(date, hour, label, direction, count)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(date, hour, label, direction)
+    INSERT INTO hourly_summary(camera_id, camera_name, date, hour, label, direction, count)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(camera_id, date, hour, label, direction)
     DO UPDATE SET count = count + ?
-    """, (date, hour, label, direction, inc, inc))
+    """, (camera_id, camera_name, date, hour, label, direction, inc, inc))
     conn.commit()
 
 # ----------------------------
@@ -487,27 +505,30 @@ def db_upsert_hourly(date, hour, label, direction, inc=1):
 # ----------------------------
 model = YOLO(MODEL_PATH)
 
-cap, ACTIVE_CAMERA_SOURCE = open_ip_camera(CAMERA_CANDIDATES)
-if cap is None:
+helpers = {
+    "open_ip_camera": open_ip_camera,
+    "clip_roi": clip_roi,
+}
+
+processor = CameraProcessor(ACTIVE_CAM, model, DB_PATH, helpers)
+
+if not processor.open_camera():
     print("Error: Could not open any IP camera stream.")
     raise SystemExit
 
-WIN = "Smart Office Gate Counter - Rudra"
-cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+cap = processor.cap
+ACTIVE_CAMERA_SOURCE = processor.active_source
+WIN = processor.win_name
 
-LINE_P1 = None
-LINE_P2 = None
-ROI = None
-
-track_state = {}          # track_id -> {"enter_side": None, "in_zone": False, "last_count_time": 0.0}
-track_motion = {}         # track_id -> (prev_cx, prev_cy)
-track_label_history = {}  # track_id -> recent labels for smoothing
+track_state = processor.track_state
+track_motion = processor.track_motion
+track_label_history = processor.track_label_history
 
 # totals
-in_total = 0
-out_total = 0
-in_by_class = defaultdict(int)
-out_by_class = defaultdict(int)
+in_total = processor.in_total
+out_total = processor.out_total
+in_by_class = processor.in_by_class
+out_by_class = processor.out_by_class
 
 # open today's CSV files (backup)
 current_day = today_str()
@@ -516,18 +537,18 @@ hourly_path = get_daily_hourly_path(current_day)
 
 events_file, events_writer = ensure_csv_header(
     events_path,
-    ["timestamp", "direction", "label", "track_id", "conf", "roi", "in_total", "out_total", "net_total", "snapshot_path"]
+    ["camera_id", "camera_name", "timestamp", "direction", "label", "track_id", "conf", "roi", "in_total", "out_total", "net_total", "snapshot_path"]
 )
 
 hourly_file, hourly_writer = ensure_csv_header(
     hourly_path,
-    ["date", "hour", "label", "direction", "count"]
+    ["camera_id", "camera_name", "date", "hour", "label", "direction", "count"]
 )
 
-prev_time = time.time()
-frame_count = 0
-last_results = None
-last_roi_origin = (0, 0)
+prev_time = processor.prev_time
+frame_count = processor.frame_count
+last_results = processor.last_results
+last_roi_origin = processor.last_roi_origin
 
 print("Controls:")
 print("  Q = quit")
@@ -561,12 +582,12 @@ try:
         ret, frame = cap.read()
         if not ret or frame is None:
             print("[WARN] Camera frame lost. Reconnecting...")
-            cap.release()
-            time.sleep(2)
-            cap, ACTIVE_CAMERA_SOURCE = open_ip_camera(CAMERA_CANDIDATES)
-            if cap is None:
+            if not processor.reconnect():
                 print("[ERROR] Reconnect failed. Exiting.")
                 break
+
+            cap = processor.cap
+            ACTIVE_CAMERA_SOURCE = processor.active_source
             continue
 
         # resize for speed
@@ -576,26 +597,16 @@ try:
             frame = cv2.resize(frame, (RESIZE_W, new_h))
             h, w = frame.shape[:2]
 
-        if LINE_P1 is None or LINE_P2 is None:
-            y_mid = h // 2
-            LINE_P1 = [0, y_mid - 30]
-            LINE_P2 = [w - 1, y_mid + 30]
-
-        if ROI is None:
-            roi_w = int(w * 0.52)
-            roi_h = int(h * 0.52)
-            x1 = int(w * 0.20)
-            y1 = int(h * 0.14)
-            ROI = [x1, y1, x1 + roi_w, y1 + roi_h]
-
-        ROI = clip_roi(ROI, w, h)
-
-
+        processor.ensure_geometry(w, h)
+        LINE_P1 = processor.line_p1
+        LINE_P2 = processor.line_p2
+        ROI = processor.roi
 
         # ----------------------------
         # DETECT ONLY INSIDE ROI
         # ----------------------------
         frame_count += 1
+        processor.frame_count = frame_count
         rx1, ry1, rx2, ry2 = ROI
         roi_frame = frame[ry1:ry2, rx1:rx2]
 
@@ -610,6 +621,8 @@ try:
                 tracker="bytetrack.yaml"
             )
             last_roi_origin = (rx1, ry1)
+            processor.last_results = last_results
+            processor.last_roi_origin = last_roi_origin
 
         results = last_results
         ox, oy = last_roi_origin
@@ -690,6 +703,26 @@ try:
                 bw = det["bw"]
                 bh = det["bh"]
 
+                raw_vehicle_crop = None
+
+                dist_to_line = abs(point_line_signed_distance(cx, cy, LINE_P1, LINE_P2))
+
+                if (
+                        label in {"car", "micro", "truck", "bus"}
+                        and bw >= 110
+                        and bh >= 70
+                        and dist_to_line <= 55
+                ):
+                    pad_x = int(bw * 0.04)
+                    pad_y = int(bh * 0.05)
+
+                    vx1 = max(0, x1 - pad_x)
+                    vy1 = max(0, y1 - pad_y)
+                    vx2 = min(w, x2 + pad_x)
+                    vy2 = min(h, y2 + pad_y)
+
+                    raw_vehicle_crop = frame[vy1:vy2, vx1:vx2].copy()
+
                 if label != "person":
                     label = smooth_track_label(track_id, label, track_label_history)
 
@@ -699,10 +732,9 @@ try:
                     dist_to_line = abs(point_line_signed_distance(cx, cy, LINE_P1, LINE_P2))
                     near_count_line = dist_to_line <= (ZONE_HALF_HEIGHT + 40)
 
-                    # Keep close and medium persons much more easily
-                    if bh < 14:
+                    if bh < 22:
                         continue
-                    if aspect_ratio < 0.35:
+                    if aspect_ratio < 0.45:
                         continue
 
                     # Apply motion filtering only to large persons that are far from the line
@@ -738,13 +770,13 @@ try:
                     direction = None
 
                     if can_count and enter_side is not None and exit_side != enter_side:
-                        # Your scene mapping:
-                        # outside -> inside = IN
-                        # inside -> outside = OUT
+                        # Corrected scene mapping:
+                        # neg -> pos = IN
+                        # pos -> neg = OUT
                         if enter_side == "neg" and exit_side == "pos":
-                            direction = "OUT"
+                            direction = ACTIVE_CAM["neg_to_pos"]
                         elif enter_side == "pos" and exit_side == "neg":
-                            direction = "IN"
+                            direction = ACTIVE_CAM["pos_to_neg"]
 
                         if direction == "IN":
                             in_total += 1
@@ -753,30 +785,74 @@ try:
                             out_total += 1
                             out_by_class[label] += 1
 
+                        processor.in_total = in_total
+                        processor.out_total = out_total
+
                         if direction:
                             st["last_count_time"] = now_ts
 
-                            net = in_total - out_total
+                            net = in_total + out_total
                             ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             roi_str = str(ROI)
 
                             snap_path = save_snapshot(frame, today_str(), direction, label, track_id, conf)
 
                             events_writer.writerow([
-                                ts_str, direction, label, track_id, f"{conf:.2f}",
-                                roi_str, in_total, out_total, net, snap_path
+                                ACTIVE_CAM["camera_id"],
+                                ACTIVE_CAM["camera_name"],
+                                ts_str,
+                                direction,
+                                label,
+                                track_id,
+                                f"{conf:.2f}",
+                                roi_str,
+                                in_total,
+                                out_total,
+                                net,
+                                snap_path
                             ])
                             events_file.flush()
 
                             d = today_str()
                             hr = hour_str()
-                            hourly_writer.writerow([d, hr, label, direction, 1])
+                            hourly_writer.writerow([
+                                ACTIVE_CAM["camera_id"],
+                                ACTIVE_CAM["camera_name"],
+                                d,
+                                hr,
+                                label,
+                                direction,
+                                1
+                            ])
                             hourly_file.flush()
 
-                            db_insert_event(ts_str, direction, label, track_id, float(conf), roi_str,
-                                            in_total, out_total, net, snap_path)
+                            event_id = db_insert_event(
+                                ACTIVE_CAM["camera_id"],
+                                ACTIVE_CAM["camera_name"],
+                                ts_str,
+                                direction,
+                                label,
+                                track_id,
+                                float(conf),
+                                roi_str,
+                                in_total,
+                                out_total,
+                                net,
+                                snap_path
+                            )
 
-                            db_upsert_hourly(d, hr, label, direction, 1)
+                            if raw_vehicle_crop is not None:
+                                processor.plate_worker.submit(event_id, raw_vehicle_crop)
+
+                            db_upsert_hourly(
+                                ACTIVE_CAM["camera_id"],
+                                ACTIVE_CAM["camera_name"],
+                                d,
+                                hr,
+                                label,
+                                direction,
+                                1
+                            )
 
                     st["in_zone"] = False
                     st["enter_side"] = None
@@ -804,20 +880,19 @@ try:
         now = time.time()
         fps = 1.0 / max(1e-6, (now - prev_time))
         prev_time = now
+        processor.prev_time = prev_time
 
         line_info = f"{LINE_P1}->{LINE_P2}"
         draw_dashboard(frame, fps, line_info, ROI, in_total, out_total, in_by_class, out_by_class)
 
         # Scale to window size
-        try:
-            x, y, win_w, win_h = cv2.getWindowImageRect(WIN)
-            disp = cv2.resize(frame, (win_w, win_h)) if win_w > 0 and win_h > 0 else frame
-        except:
-            disp = frame
+        disp = frame
 
         cv2.imshow(WIN, disp)
 
         key = cv2.waitKey(1) & 0xFF
+        if key != 255:
+            print("KEY:", key, chr(key) if 32 <= key <= 126 else key)
         if key in (ord("q"), ord("Q")):
             break
 
@@ -860,11 +935,19 @@ try:
             ROI[2] = max(ROI[0] + 50, ROI[2] - ROI_RESIZE_STEP)
             ROI[3] = max(ROI[1] + 50, ROI[3] - ROI_RESIZE_STEP)
 
-        ROI = clip_roi(ROI, w, h)
+        processor.line_p1 = LINE_P1
+        processor.line_p2 = LINE_P2
+        processor.roi = clip_roi(ROI, w, h)
+
+        LINE_P1 = processor.line_p1
+        LINE_P2 = processor.line_p2
+        ROI = processor.roi
+
+        if key != 255:
+            print("LINE:", LINE_P1, LINE_P2, "ROI:", ROI)
 
 finally:
-    cap.release()
-    cv2.destroyAllWindows()
+    processor.close()
     events_file.close()
     hourly_file.close()
     conn.close()

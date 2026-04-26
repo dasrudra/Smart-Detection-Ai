@@ -7,13 +7,16 @@ cur.execute("SELECT COUNT(*) FROM events")
 print("Total events:", cur.fetchone()[0])
 
 cur.execute("""
-SELECT date, hour, label, direction, count
-FROM hourly_summary
-ORDER BY date DESC, hour DESC, count DESC
-LIMIT 10
+SELECT ts, label, direction, track_id, conf, plate_text, plate_score, plate_image_path, snapshot_path
+FROM events
+WHERE label IN ('car', 'truck', 'bus', 'micro', 'motorcycle')
+ORDER BY id DESC
+LIMIT 20
 """)
+
 rows = cur.fetchall()
-print("Top hourly rows:")
+
+print("\nLatest events:")
 for r in rows:
     print(r)
 
